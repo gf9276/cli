@@ -1,0 +1,77 @@
+name: ohos-arm-test
+
+# Fork-only verification pipeline for PR !515 (OpenHarmony arm64 support).
+# Runs on a free GitHub arm64 runner and validates three layers:
+#   L1  npm wrapper platform mapping (process.platform "openharmony" -> gc-linux-arm64)
+#   L2  static gc-linux-arm64 binary inside musl userland
+#       (OpenHarmony-adjacent proxy: musl libc + static CGO_ENABLED=0 Go binary)
+#   L2b real npm wrapper (npm/bin/gc.js) driving the bundled binary under musl node
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ohos:
+    name: OpenHarmony arm64 verification
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.22'
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Runner sanity
+        run: |
+          echo "uname: $(uname -m), node: $(node -p 'process.platform + "/" + process.arch'), docker server arch: $(docker version --format '{{.Server.Arch}}')"
+
+      - name: Build static gc-linux-arm64 (mirrors repo CI build)
+        run: |
+          VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo "dev")
+          COMMIT=$(git rev-parse --short HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.date=${DATE}"
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o gc-linux-arm64 ./cmd/gc
+
+      - name: Verify static linking (no libc dependency)
+        run: |
+          file gc-linux-arm64
+          ldd gc-linux-arm64 2>&1 || true
+          ldd gc-linux-arm64 2>&1 | grep -q "not a dynamic executable"
+
+      - name: "L1: npm platform unit tests on arm64"
+        run: node --test npm/test/platform.test.js
+
+      - name: "L1: mapping assertions (openharmony/arm64 -> gc-linux-arm64)"
+        run: |
+          node -e "const{resolveBinaryName,isSupported}=require('./npm/lib/platform.js');const n=resolveBinaryName('openharmony','arm64');console.log('openharmony/arm64 ->',n);if(n!=='gc-linux-arm64')process.exit(1);if(!isSupported('openharmony','arm64'))process.exit(1);console.log('isSupported(openharmony,arm64)=true OK')"
+          node -e "const{resolveBinaryName,isSupported}=require('./npm/lib/platform.js');const n=resolveBinaryName('openharmony','x64');console.log('openharmony/x64 ->',n,'isSupported:',isSupported('openharmony','x64'),'(documented surface: arm64 only, see PR !515 review P1)')"
+
+      - name: "L1: simulated wrapper path (process.platform patched to openharmony)"
+        run: |
+          node -e "Object.defineProperty(process,'platform',{value:'openharmony'});const{isSupported,resolveBinaryName}=require('./npm/lib/platform.js');if(!isSupported(process.platform,process.arch))process.exit(1);const n=resolveBinaryName(process.platform,process.arch);console.log('patched process.platform ->',n);if(n!=='gc-linux-arm64')process.exit(1)"
+
+      - name: Stage bundled binary for wrapper tests
+        run: |
+          mkdir -p npm/bin/platforms
+          install -m 0755 gc-linux-arm64 npm/bin/platforms/gc-linux-arm64
+
+      - name: "L2: static binary in musl userland (alpine)"
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w alpine:latest /w/gc-linux-arm64 version
+          docker run --rm -v "$PWD:/w" -w /w alpine:latest sh -c "/w/gc-linux-arm64 --help | head -n 5"
+
+      - name: "L2: npm wrapper (bin/gc.js) under musl node, native linux path"
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w node:24-alpine node /w/npm/bin/gc.js version
+
+      - name: "L2: wrapper resolution with openharmony platform under musl node"
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w node:24-alpine node -e "Object.defineProperty(process,'platform',{value:'openharmony'});const{resolveBinaryName}=require('/w/npm/lib/platform.js');const n=resolveBinaryName(process.platform,process.arch);console.log('musl node + openharmony patch ->',n);require('child_process').execFileSync('/w/npm/bin/platforms/'+n,['version'],{stdio:'inherit'});"
