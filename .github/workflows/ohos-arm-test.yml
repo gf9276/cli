@@ -6,6 +6,10 @@ name: ohos-arm-test
 #   L2  static gc-linux-arm64 binary inside musl userland
 #       (OpenHarmony-adjacent proxy: musl libc + static CGO_ENABLED=0 Go binary)
 #   L2b real npm wrapper (npm/bin/gc.js) driving the bundled binary under musl node
+#   L3  static gc inside the real OpenHarmony 7.0 userland (dockerharmony container:
+#       official OHOS rk3568 build artifacts: toybox/mksh/musl/SDK libs)
+#   L3b real OpenHarmony Node build (hqzing/ohos-node, process.platform == "openharmony"
+#       natively) running the unpatched npm wrapper end-to-end
 on:
   workflow_dispatch:
 
@@ -75,3 +79,17 @@ jobs:
       - name: "L2: wrapper resolution with openharmony platform under musl node"
         run: |
           docker run --rm -v "$PWD:/w" -w /w node:24-alpine node -e "Object.defineProperty(process,'platform',{value:'openharmony'});const{resolveBinaryName}=require('/w/npm/lib/platform.js');const n=resolveBinaryName(process.platform,process.arch);console.log('musl node + openharmony patch ->',n);require('child_process').execFileSync('/w/npm/bin/platforms/'+n,['version'],{stdio:'inherit'});"
+
+      - name: "L3: real OpenHarmony 7.0 userland (dockerharmony container)"
+        run: |
+          docker pull ghcr.io/hqzing/dockerharmony:7.0
+          docker image inspect ghcr.io/hqzing/dockerharmony:7.0 --format 'image digest on record: {{index .RepoDigests 0}}'
+          docker run --rm ghcr.io/hqzing/dockerharmony:7.0 sh -c 'echo "userland sanity: sh=${KSH_VERSION:-unknown}"; uname -m; ls /system >/dev/null 2>&1 && echo "layout: /system present"'
+          docker run --rm -v "$PWD:/w" ghcr.io/hqzing/dockerharmony:7.0 sh -c '/w/gc-linux-arm64 version && /w/gc-linux-arm64 --help | head -n 5'
+
+      - name: "L3b: real OpenHarmony Node (native process.platform=openharmony) runs wrapper end-to-end"
+        run: |
+          curl -fsSL --retry 3 -o node-ohos.tar.gz https://github.com/hqzing/ohos-node/releases/download/v24.2.0/node-v24.2.0-openharmony-arm64.tar.gz
+          tar -zxf node-ohos.tar.gz
+          docker run --rm -v "$PWD:/w" ghcr.io/hqzing/dockerharmony:7.0 sh -c '/w/node-v24.2.0-openharmony-arm64/bin/node -p "\"process.platform=\" + process.platform + \" process.arch=\" + process.arch"'
+          docker run --rm -v "$PWD:/w" ghcr.io/hqzing/dockerharmony:7.0 sh -c 'cd /w && /w/node-v24.2.0-openharmony-arm64/bin/node npm/bin/gc.js version'
